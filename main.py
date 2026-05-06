@@ -304,48 +304,40 @@ def save_openclaw_config(config: dict):
 def format_model_for_openclaw(model_id: str, append_free: bool = True) -> str:
     """Format an OpenRouter model ID for OpenClaw config.
 
-    Always returns the routing-prefixed form OpenClaw expects in `primary`,
-    `fallbacks`, and the `models` allowlist:
+    OpenClaw routes by first segment: it parses the leading `<provider>/`,
+    sets that as the provider, and forwards the rest verbatim to the
+    provider's API. So *every* config value gets a leading `openrouter/`
+    routing prefix — even for OpenRouter-native models, which means a
+    literal `openrouter/openrouter/free` lands in config. After OpenClaw
+    strips the leading provider, OpenRouter receives the bare `openrouter/free`
+    model ID it actually expects.
 
+    Examples:
       qwen/qwen3-coder:free   → openrouter/qwen/qwen3-coder:free
-      qwen/qwen3-coder        → openrouter/qwen/qwen3-coder:free   (append_free=True)
-      openrouter/owl-alpha    → openrouter/owl-alpha               (native, verbatim)
-      openrouter/free         → openrouter/free                    (native, verbatim)
+      qwen/qwen3-coder        → openrouter/qwen/qwen3-coder:free  (append_free=True)
+      openrouter/free         → openrouter/openrouter/free
+      openrouter/owl-alpha    → openrouter/openrouter/owl-alpha
 
-    The leading `openrouter/` is OpenClaw's routing prefix — it tells the
-    gateway to dispatch via the OpenRouter provider (using OPENROUTER_API_KEY)
-    rather than inferring the provider from the first segment of the ID.
-    Without it, OpenClaw sees `google/gemma:free` and tries to route to
-    Google's API directly, asking the user for a Google key (issue #12).
-
-    OpenRouter-native models (`openrouter/free`, `openrouter/owl-alpha`) are
-    already fully qualified — the prefix is part of their identity, not a
-    separate routing prefix. They are returned verbatim, which also means we
-    can never accidentally double-prefix to `openrouter/openrouter/...`.
+    OpenRouter-native models (those whose API ID already starts with
+    `openrouter/`) don't take the `:free` tier suffix.
     """
-    if model_id.startswith("openrouter/"):
-        return model_id
+    is_native = model_id.startswith("openrouter/")
     base_id = model_id
-    if append_free and ":free" not in base_id:
+    if append_free and not is_native and ":free" not in base_id:
         base_id = f"{base_id}:free"
     return f"openrouter/{base_id}"
 
 
 def _config_primary_to_api_id(stored_id: str) -> str:
-    """Convert an OpenClaw `model.primary` value back to the OpenRouter API ID.
+    """Recover the OpenRouter API model ID by stripping OpenClaw's leading
+    `openrouter/` provider prefix. Inverse of `format_model_for_openclaw`.
 
-    `openrouter/qwen/qwen3-coder:free` (vendor-prefixed) → `qwen/qwen3-coder:free`
-    `openrouter/owl-alpha`            (native, no vendor) → `openrouter/owl-alpha`
-    `openrouter/free`                 (smart router)      → `openrouter/free`
-
-    Heuristic: the routing prefix is present iff what follows the leading
-    `openrouter/` still contains a `/` (a vendor segment). Otherwise the stored
-    value IS the API ID.
+      openrouter/qwen/qwen3-coder:free  → qwen/qwen3-coder:free
+      openrouter/openrouter/free        → openrouter/free
+      openrouter/openrouter/owl-alpha   → openrouter/owl-alpha
     """
-    if not stored_id.startswith("openrouter/"):
-        return stored_id
-    rest = stored_id[len("openrouter/"):]
-    return rest if "/" in rest else stored_id
+    prefix = "openrouter/"
+    return stored_id[len(prefix):] if stored_id.startswith(prefix) else stored_id
 
 
 def get_current_model(config: dict = None) -> Optional[str]:
@@ -427,10 +419,10 @@ def update_model_config(
 
         # openrouter/free smart router is always the first fallback unless the
         # user is making it the primary.
-        free_router = "openrouter/free"
-        if formatted != free_router:
-            new_fallbacks.append(free_router)
-            config["agents"]["defaults"]["models"][free_router] = {}
+        smart_router = format_model_for_openclaw("openrouter/free")
+        if formatted != smart_router:
+            new_fallbacks.append(smart_router)
+            config["agents"]["defaults"]["models"][smart_router] = {}
 
         for m in free_models:
             if len(new_fallbacks) >= fallback_count:
@@ -451,7 +443,7 @@ def update_model_config(
 
         if not as_primary:
             if formatted not in new_fallbacks:
-                insert_pos = 1 if free_router in new_fallbacks else 0
+                insert_pos = 1 if smart_router in new_fallbacks else 0
                 new_fallbacks.insert(insert_pos, formatted)
             config["agents"]["defaults"]["models"][formatted] = {}
 
@@ -756,10 +748,10 @@ def cmd_fallbacks(args):
     fallbacks = []
 
     # openrouter/free smart router always leads.
-    free_router = "openrouter/free"
-    if not current or current != free_router:
-        fallbacks.append(free_router)
-        config["agents"]["defaults"]["models"][free_router] = {}
+    smart_router = format_model_for_openclaw("openrouter/free")
+    if not current or current != smart_router:
+        fallbacks.append(smart_router)
+        config["agents"]["defaults"]["models"][smart_router] = {}
 
     for m in models:
         formatted = format_model_for_openclaw(m["id"])
@@ -904,8 +896,9 @@ def rotate(force: bool = False, fallback_count: int = 5):
     config["agents"]["defaults"]["model"]["primary"] = formatted
     config["agents"]["defaults"]["models"][formatted] = {}
 
-    fallbacks = ["openrouter/free"]
-    config["agents"]["defaults"]["models"]["openrouter/free"] = {}
+    smart_router = format_model_for_openclaw("openrouter/free")
+    fallbacks = [smart_router]
+    config["agents"]["defaults"]["models"][smart_router] = {}
     for fb_id in verified_fallbacks:
         fb_fmt = format_model_for_openclaw(fb_id)
         fallbacks.append(fb_fmt)
