@@ -68,6 +68,7 @@ Verify by telling the user to send `/status` to check the active model.
 | `freeride status` | Check current FreeRide configuration |
 | `freeride fallbacks` | Update only the fallback models |
 | `freeride refresh` | Force refresh the cached model list |
+| `freeride rotate` | User is rate-limited / fallback chain is dead — live-test and rebuild |
 
 **After any command that changes config, always run `openclaw gateway restart`.**
 
@@ -83,15 +84,30 @@ Everything else (gateway, channels, plugins, env, customInstructions, named agen
 
 The first fallback is always `openrouter/free` — OpenRouter's smart router that auto-picks the best available model based on the request.
 
-## Watcher (Optional)
+## Watcher (Background Daemon)
 
-For auto-rotation when rate limited, the user can run:
+For autonomous recovery from a "whole chain is rate-limited" deadlock — which
+the agent can't fix by itself, since calling `freeride rotate` requires
+inference and inference is exactly what's failing — the user can run a slim
+background daemon:
 
 ```bash
-freeride-watcher --daemon    # Continuous monitoring
-freeride-watcher --rotate    # Force rotate now
-freeride-watcher --status    # Check rotation history
+# Foreground
+freeride-watcher
+
+# Persistent background
+nohup freeride-watcher > ~/.openclaw/freeride-watcher.log 2>&1 &
+
+# One-shot check (no loop)
+freeride-watcher --once
+
+# State / history
+freeride-watcher --status
 ```
+
+The daemon probes the current primary every 60s; if it fails, it rebuilds the
+chain with live-verified models. Recommend this whenever the user is leaving
+an unattended OpenClaw setup running.
 
 ## Troubleshooting
 

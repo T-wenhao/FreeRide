@@ -23,9 +23,30 @@ except ImportError:
 
 # Constants
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/models"
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 CACHE_FILE = Path.home() / ".openclaw" / ".freeride-cache.json"
 CACHE_DURATION_HOURS = 6
+
+# Per-process tracking of keys that recently returned 429/401, with a soft
+# cooldown so keys come back into rotation automatically. Short-lived CLI runs
+# never reach the cooldown; the watcher daemon does.
+_KEY_COOLDOWN_SECONDS = 120
+_RATE_LIMITED_KEYS: dict = {}  # key -> timestamp when marked
+
+
+def _is_key_in_cooldown(key: str) -> bool:
+    ts = _RATE_LIMITED_KEYS.get(key)
+    if ts is None:
+        return False
+    if time.time() - ts > _KEY_COOLDOWN_SECONDS:
+        _RATE_LIMITED_KEYS.pop(key, None)
+        return False
+    return True
+
+
+def _mark_key_rate_limited(key: str):
+    _RATE_LIMITED_KEYS[key] = time.time()
 
 # Free model ranking criteria (higher is better)
 RANKING_WEIGHTS = {
@@ -42,8 +63,12 @@ TRUSTED_PROVIDERS = [
 ]
 
 
-def _parse_api_keys(raw: str) -> list:
-    """Parse a single key string or a JSON array of keys."""
+def _parse_api_keys(raw) -> list:
+    """Parse a single key string, a JSON array literal, or a real list of keys."""
+    if isinstance(raw, list):
+        return [k.strip() for k in raw if isinstance(k, str) and k.strip()]
+    if not isinstance(raw, str):
+        return []
     raw = raw.strip()
     if raw.startswith("["):
         try:
@@ -83,43 +108,91 @@ def get_api_key() -> Optional[str]:
     return keys[0] if keys else None
 
 
-def fetch_all_models(api_key: str) -> list:
-    """Fetch all models from OpenRouter API."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.get(OPENROUTER_API_URL, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("data", [])
-    except requests.RequestException as e:
-        print(f"Error fetching models: {e}")
+def fetch_all_models() -> list:
+    """Fetch all models from OpenRouter, rotating through API keys on 429/401."""
+    keys = get_api_keys()
+    if not keys:
         return []
+
+    last_status = None
+    for i, key in enumerate(keys, 1):
+        if _is_key_in_cooldown(key):
+            continue
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.get(OPENROUTER_API_URL, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            print(f"  Key {i}: network error ({e})")
+            continue
+
+        if response.status_code == 200:
+            return response.json().get("data", [])
+        if response.status_code in (401, 429):
+            label = "invalid" if response.status_code == 401 else "rate-limited"
+            print(f"  Key {i}: {label}, trying next...")
+            _mark_key_rate_limited(key)
+            last_status = response.status_code
+            continue
+        print(f"Error fetching models: HTTP {response.status_code}")
+        return []
+
+    if last_status:
+        print(f"Error: all API keys exhausted (last status: {last_status}).")
+    else:
+        print("Error: no usable API keys.")
+    return []
+
+
+def _is_chat_model(model: dict) -> bool:
+    """True if the model produces text-only output, i.e. is suitable for
+    /chat/completions. Filters out image-gen, audio-gen, and multi-modal output
+    models (e.g. Lyria's `text+image->text+audio`) that aren't chat-shaped.
+    """
+    arch = model.get("architecture") or {}
+
+    # Preferred: explicit output_modalities array
+    out_mods = arch.get("output_modalities")
+    if isinstance(out_mods, list) and out_mods:
+        return out_mods == ["text"]
+
+    # Fallback: parse modality string like "text+image->text" or "text->text+audio"
+    modality = arch.get("modality", "")
+    if isinstance(modality, str) and "->" in modality:
+        output_part = modality.split("->", 1)[1].strip()
+        return output_part == "text"
+
+    # Unknown shape — keep it; rotate's live probe will catch false positives.
+    return True
 
 
 def filter_free_models(models: list) -> list:
-    """Filter models to only include free ones (pricing.prompt == 0)."""
+    """Filter models to free, text-output (chat-shaped) models only."""
     free_models = []
+    seen_ids = set()
 
     for model in models:
         model_id = model.get("id", "")
-        pricing = model.get("pricing", {})
+        if model_id in seen_ids:
+            continue
+        if not _is_chat_model(model):
+            continue
 
-        # Check if model is free (prompt cost is 0 or None)
-        prompt_cost = pricing.get("prompt")
+        is_free = False
+        prompt_cost = model.get("pricing", {}).get("prompt")
         if prompt_cost is not None:
             try:
-                if float(prompt_cost) == 0:
-                    free_models.append(model)
+                is_free = float(prompt_cost) == 0
             except (ValueError, TypeError):
                 pass
+        if not is_free and ":free" in model_id:
+            is_free = True
 
-        # Also include models with :free suffix
-        if ":free" in model_id and model not in free_models:
+        if is_free:
             free_models.append(model)
+            seen_ids.add(model_id)
 
     return free_models
 
@@ -195,18 +268,19 @@ def save_models_cache(models: list):
     CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 
-def get_free_models(api_key: str, force_refresh: bool = False) -> list:
+def get_free_models(force_refresh: bool = False) -> list:
     """Get ranked free models (from cache or API)."""
     if not force_refresh:
         cached = get_cached_models()
         if cached:
             return cached
 
-    all_models = fetch_all_models(api_key)
+    all_models = fetch_all_models()
     free_models = filter_free_models(all_models)
     ranked_models = rank_free_models(free_models)
 
-    save_models_cache(ranked_models)
+    if ranked_models:
+        save_models_cache(ranked_models)
     return ranked_models
 
 
@@ -228,31 +302,45 @@ def save_openclaw_config(config: dict):
 
 
 def format_model_for_openclaw(model_id: str, with_provider_prefix: bool = True, append_free: bool = True) -> str:
-    """Format model ID for OpenClaw config.
+    """Format an OpenRouter model ID for OpenClaw's config.
 
-    OpenClaw uses two formats:
-    - Primary model: "openrouter/<author>/<model>:free" (with provider prefix)
-    - Fallbacks/models list: "<author>/<model>:free" (without prefix sometimes)
+    Most free models are `<vendor>/<model>:free` (e.g. `qwen/qwen3-coder:free`).
+    OpenClaw stores the primary as `openrouter/<vendor>/<model>:free` (with a
+    routing prefix) and fallbacks as the bare `<vendor>/<model>:free`.
+
+    OpenRouter-native models (`openrouter/free`, `openrouter/owl-alpha`) are
+    already fully qualified — the leading `openrouter/` is part of the model's
+    own ID, not a separate routing prefix. They go in verbatim everywhere and
+    don't take the `:free` tier suffix.
     """
+    # OpenRouter-native: use verbatim, don't re-prefix or append :free.
+    if model_id.startswith("openrouter/"):
+        return model_id
+
     base_id = model_id
-
-    # openrouter/free is OpenRouter's smart router — its API model ID is literally
-    # "openrouter/free" with no extra prefix. Adding another "openrouter/" prefix
-    # produces "openrouter/openrouter/free" which OpenClaw and OpenRouter both reject.
-    if model_id in ("openrouter/free", "openrouter/free:free"):
-        return "openrouter/free"
-
-    # Remove existing openrouter/ routing prefix if present to get the base API ID
-    if base_id.startswith("openrouter/"):
-        base_id = base_id[len("openrouter/"):]
-
-    # Ensure :free suffix
     if append_free and ":free" not in base_id:
         base_id = f"{base_id}:free"
 
     if with_provider_prefix:
         return f"openrouter/{base_id}"
     return base_id
+
+
+def _config_primary_to_api_id(stored_id: str) -> str:
+    """Convert an OpenClaw `model.primary` value back to the OpenRouter API ID.
+
+    `openrouter/qwen/qwen3-coder:free` (vendor-prefixed) → `qwen/qwen3-coder:free`
+    `openrouter/owl-alpha`            (native, no vendor) → `openrouter/owl-alpha`
+    `openrouter/free`                 (smart router)      → `openrouter/free`
+
+    Heuristic: the routing prefix is present iff what follows the leading
+    `openrouter/` still contains a `/` (a vendor segment). Otherwise the stored
+    value IS the API ID.
+    """
+    if not stored_id.startswith("openrouter/"):
+        return stored_id
+    rest = stored_id[len("openrouter/"):]
+    return rest if "/" in rest else stored_id
 
 
 def get_current_model(config: dict = None) -> Optional[str]:
@@ -333,9 +421,8 @@ def update_model_config(
 
     # Handle fallbacks
     if add_fallbacks:
-        api_key = get_api_key()
-        if api_key:
-            free_models = get_free_models(api_key)
+        if get_api_keys():
+            free_models = get_free_models()
 
             # Get existing fallbacks
             existing_fallbacks = config["agents"]["defaults"]["model"].get("fallbacks", [])
@@ -393,15 +480,14 @@ def update_model_config(
 
 def cmd_list(args):
     """List available free models ranked by quality."""
-    api_key = get_api_key()
-    if not api_key:
+    if not get_api_keys():
         print("Error: OPENROUTER_API_KEY not set")
         print("Set it via: export OPENROUTER_API_KEY='sk-or-...'")
         print("Or get a free key at: https://openrouter.ai/keys")
         sys.exit(1)
 
     print("Fetching free models from OpenRouter...")
-    models = get_free_models(api_key, force_refresh=args.refresh)
+    models = get_free_models(force_refresh=args.refresh)
 
     if not models:
         print("No free models available.")
@@ -453,8 +539,7 @@ def cmd_list(args):
 
 def cmd_switch(args):
     """Switch to a specific free model."""
-    api_key = get_api_key()
-    if not api_key:
+    if not get_api_keys():
         print("Error: OPENROUTER_API_KEY not set")
         sys.exit(1)
 
@@ -462,7 +547,7 @@ def cmd_switch(args):
     as_fallback = args.fallback_only
 
     # Validate model exists and is free
-    models = get_free_models(api_key)
+    models = get_free_models()
     model_ids = [m["id"] for m in models]
 
     # Check for exact match or partial match
@@ -518,8 +603,7 @@ def cmd_switch(args):
 
 def cmd_auto(args):
     """Automatically select the best free model."""
-    api_key = get_api_key()
-    if not api_key:
+    if not get_api_keys():
         print("Error: OPENROUTER_API_KEY not set")
         sys.exit(1)
 
@@ -527,7 +611,7 @@ def cmd_auto(args):
     current_primary = get_current_model(config)
 
     print("Finding best free model...")
-    models = get_free_models(api_key, force_refresh=True)
+    models = get_free_models(force_refresh=True)
 
     if not models:
         print("Error: No free models available.")
@@ -645,7 +729,7 @@ def cmd_status(args):
             hours = age.seconds // 3600
             mins = (age.seconds % 3600) // 60
             print(f"\nModel Cache: {models_count} models (updated {hours}h {mins}m ago)")
-        except:
+        except (json.JSONDecodeError, ValueError, KeyError):
             print("\nModel Cache: Invalid")
     else:
         print("\nModel Cache: Not created yet")
@@ -657,21 +741,19 @@ def cmd_status(args):
 
 def cmd_refresh(args):
     """Force refresh the model cache."""
-    api_key = get_api_key()
-    if not api_key:
+    if not get_api_keys():
         print("Error: OPENROUTER_API_KEY not set")
         sys.exit(1)
 
     print("Refreshing free models cache...")
-    models = get_free_models(api_key, force_refresh=True)
+    models = get_free_models(force_refresh=True)
     print(f"Cached {len(models)} free models.")
     print(f"Cache expires in {CACHE_DURATION_HOURS} hours.")
 
 
 def cmd_fallbacks(args):
     """Configure fallback models for rate limit handling."""
-    api_key = get_api_key()
-    if not api_key:
+    if not get_api_keys():
         print("Error: OPENROUTER_API_KEY not set")
         sys.exit(1)
 
@@ -685,7 +767,7 @@ def cmd_fallbacks(args):
     print(f"Current primary: {current or 'None'}")
     print(f"Setting up {args.count} fallback models...")
 
-    models = get_free_models(api_key)
+    models = get_free_models()
     config = ensure_config_structure(config)
 
     # Get fallbacks excluding current model
@@ -722,6 +804,162 @@ def cmd_fallbacks(args):
 
     print("\nWhen rate limited, OpenClaw will automatically try these models.")
     print("Restart OpenClaw for changes to take effect.")
+
+
+def _test_model(model_id: str):
+    """Probe a model with a tiny chat call. Rotates through API keys on 429/401.
+
+    Returns (success: bool, error: Optional[str]). Error codes:
+      "all_keys_exhausted", "model_not_found", "unavailable", "timeout",
+      "request_error", "error_<status>".
+    """
+    available = [k for k in get_api_keys() if not _is_key_in_cooldown(k)]
+    if not available:
+        return False, "all_keys_exhausted"
+
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 5,
+        "stream": False
+    }
+
+    for key in available:
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Shaivpidadi/FreeRide",
+            "X-Title": "FreeRide"
+        }
+        try:
+            response = requests.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=30)
+        except requests.Timeout:
+            return False, "timeout"
+        except requests.RequestException:
+            return False, "request_error"
+
+        if response.status_code == 200:
+            return True, None
+        if response.status_code in (401, 429):
+            _mark_key_rate_limited(key)
+            continue  # try next key — this one is dead for now
+        if response.status_code == 503:
+            return False, "unavailable"
+
+        # OpenRouter returns model_not_found in the body on 4xx — check the body
+        # regardless of status code.
+        try:
+            body = response.json()
+            err_code = body.get("error", {}).get("code", "")
+            err_msg = str(body.get("error", {}).get("message", ""))
+            if err_code == "model_not_found" or "Unknown model" in err_msg:
+                return False, "model_not_found"
+        except (ValueError, KeyError):
+            pass
+        return False, f"error_{response.status_code}"
+
+    return False, "all_keys_exhausted"
+
+
+def rotate(force: bool = False, fallback_count: int = 5):
+    """Live-test current primary; swap to a verified working model if it fails.
+
+    Tests every candidate via /chat/completions before writing it to config, so
+    no stale model IDs end up in the fallback chain. Tries multiple API keys.
+
+    Returns (changed: bool, error: Optional[str]). `changed` is True when the
+    config was rewritten; `error` is set when nothing could be done.
+    """
+    if not get_api_keys():
+        return False, "no_keys"
+
+    config = load_openclaw_config()
+    config = ensure_config_structure(config)
+    current = get_current_model(config)
+    current_base = _config_primary_to_api_id(current) if current else None
+
+    if current_base and not force:
+        print(f"Testing current primary: {current_base}")
+        ok, err = _test_model(current_base)
+        if ok:
+            print("  Status: OK — no rotation needed.")
+            return False, None
+        print(f"  Status: {err}")
+
+    print("Finding a working free model...")
+    models = get_free_models(force_refresh=True)
+    if not models:
+        return False, "fetch_failed"
+
+    # openrouter/free is always fallback #0, so we need (count - 1) verified extras.
+    fallback_target = max(0, fallback_count - 1)
+    new_primary = None
+    verified_fallbacks = []
+
+    for m in models:
+        model_id = m["id"]
+        if "openrouter/free" in model_id:
+            continue
+        if model_id == current_base:
+            continue
+
+        ok, err = _test_model(model_id)
+        if ok:
+            if new_primary is None:
+                new_primary = model_id
+                print(f"  Verified primary: {model_id}")
+            else:
+                verified_fallbacks.append(model_id)
+                print(f"  Verified fallback: {model_id}")
+            if len(verified_fallbacks) >= fallback_target:
+                break
+        elif err == "all_keys_exhausted":
+            print("  Stopped: all API keys are rate-limited or invalid.")
+            break
+        # Silent on per-model failures (model_not_found, etc.) — try next.
+
+    if not new_primary:
+        return False, "no_working_models"
+
+    formatted_primary = format_model_for_openclaw(new_primary, with_provider_prefix=True)
+    formatted_for_list = format_model_for_openclaw(new_primary, with_provider_prefix=False)
+    config["agents"]["defaults"]["model"]["primary"] = formatted_primary
+    config["agents"]["defaults"]["models"][formatted_for_list] = {}
+
+    fallbacks = ["openrouter/free"]
+    config["agents"]["defaults"]["models"]["openrouter/free"] = {}
+    for fb_id in verified_fallbacks:
+        fb_fmt = format_model_for_openclaw(fb_id, with_provider_prefix=False)
+        fallbacks.append(fb_fmt)
+        config["agents"]["defaults"]["models"][fb_fmt] = {}
+
+    config["agents"]["defaults"]["model"]["fallbacks"] = fallbacks
+    save_openclaw_config(config)
+
+    print(f"Done. Primary: {formatted_primary}")
+    print(f"Fallbacks ({len(fallbacks)}):")
+    for fb in fallbacks:
+        print(f"  - {fb}")
+    return True, None
+
+
+def cmd_rotate(args):
+    """CLI wrapper around rotate()."""
+    if not get_api_keys():
+        print("Error: OPENROUTER_API_KEY not set")
+        sys.exit(1)
+
+    changed, err = rotate(force=args.force, fallback_count=args.fallback_count)
+    if err == "fetch_failed":
+        print("Error: could not fetch free model list (all keys exhausted?).")
+        sys.exit(1)
+    if err == "no_working_models":
+        print("Error: no working free models found.")
+        sys.exit(1)
+    if changed:
+        print("\nRestart OpenClaw for changes to take effect.")
+    elif not err:
+        print("  (Use --force to rotate anyway.)")
 
 
 def main():
@@ -768,6 +1006,14 @@ def main():
     fallbacks_parser.add_argument("--count", "-c", type=int, default=5,
                                  help="Number of fallback models (default: 5)")
 
+    # rotate command
+    rotate_parser = subparsers.add_parser("rotate",
+        help="Live-test current primary; swap to a working model if it fails")
+    rotate_parser.add_argument("--force", "-f", action="store_true",
+                              help="Rotate even if the current primary is healthy")
+    rotate_parser.add_argument("--fallback-count", "-c", type=int, default=5,
+                              help="Total fallback slots including openrouter/free (default: 5)")
+
     args = parser.parse_args()
 
     if args.command == "list":
@@ -782,6 +1028,8 @@ def main():
         cmd_refresh(args)
     elif args.command == "fallbacks":
         cmd_fallbacks(args)
+    elif args.command == "rotate":
+        cmd_rotate(args)
     else:
         parser.print_help()
         sys.exit(1)

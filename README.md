@@ -65,8 +65,10 @@ No credit card. No trial. Actually free.
 ### 2. Set Your Key
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-..."   OR
-export OPENROUTER_API_KEY=["sk-or-v1-...","sk-or-v2-..." ] # By passing multiple keys it swaps the key on 429 
+export OPENROUTER_API_KEY="sk-or-v1-..."
+
+# Or, multiple keys (shown in `freeride status`):
+export OPENROUTER_API_KEY='["sk-or-v1-key1","sk-or-v1-key2"]'
 ```
 
 Or add it to your OpenClaw config:
@@ -123,6 +125,7 @@ When you hit a rate limit, OpenClaw automatically tries the next model. You keep
 | `freeride status` | Check your current setup |
 | `freeride fallbacks` | Update fallbacks only |
 | `freeride refresh` | Force refresh model cache |
+| `freeride rotate` | Live-test primary; swap to a working model if it's failing |
 
 ### Pro Tips
 
@@ -180,26 +183,34 @@ Useful agent commands to verify:
 | `/model` | Available models (your free models should be listed) |
 | `/new` | Start fresh session with the new model |
 
-## Watcher (Auto-Rotation)
+## Watcher (Background Daemon)
 
-FreeRide includes a watcher daemon that monitors for rate limits and automatically rotates models:
+The watcher is a long-running process that probes your current primary model
+every minute and rotates the config the moment it starts failing. Because it
+runs **outside** the agent's inference loop, it can recover from a "everything
+is 429" deadlock that the agent itself can't escape (the agent would need
+inference to call `freeride rotate`, but inference is exactly what's broken).
 
 ```bash
-# Run once (check + rotate if needed)
+# Foreground (good for trying it out)
 freeride-watcher
 
-# Run as daemon (continuous monitoring)
-freeride-watcher --daemon
+# Background, persistent across logout
+nohup freeride-watcher > ~/.openclaw/freeride-watcher.log 2>&1 &
 
-# Force rotate to next model
-freeride-watcher --rotate
+# One-off check (no loop)
+freeride-watcher --once
 
-# Check watcher status
+# See state (rotation count, last reason)
 freeride-watcher --status
 
-# Clear rate limit cooldowns
-freeride-watcher --clear-cooldowns
+# Custom interval (seconds)
+freeride-watcher --interval 120
 ```
+
+For an actual service, point your favorite supervisor (launchd, systemd,
+tmux, pm2) at `freeride-watcher`. There is no PID file — stop it with
+`Ctrl-C` or `kill <pid>`.
 
 ## FAQ
 
@@ -209,7 +220,12 @@ Yes. OpenRouter provides free tiers for many models. You just need an account (n
 
 **What about rate limits?**
 
-That's the whole point. FreeRide configures multiple fallbacks. When one model rate-limits you, OpenClaw automatically switches to the next.
+Three layers of defense:
+1. **OpenClaw's runtime fallback chain** — when the primary returns 429, the gateway transparently tries fallback 1, 2, 3 at routing time. The agent never sees the 429.
+2. **`openrouter/free` smart router** is always fallback #1 — server-side smart routing onto whatever free model is actually available.
+3. **`freeride-watcher` daemon** — runs in the background, probes the primary every 60s, rotates the config the moment it starts failing. This is what saves you when the entire fallback chain is dead and the agent has nothing left to route to.
+
+If you've set multiple keys via `OPENROUTER_API_KEY='["key1","key2"]'`, every layer above also rotates through them on 429.
 
 **Will it mess up my OpenClaw config?**
 
