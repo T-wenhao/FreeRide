@@ -28,6 +28,21 @@ OPENCLAW_CONFIG_PATH = Path.home() / ".openclaw" / "openclaw.json"
 CACHE_FILE = Path.home() / ".openclaw" / ".freeride-cache.json"
 CACHE_DURATION_HOURS = 6
 
+# OpenRouter app-attribution headers — applied to every request so all
+# FreeRide traffic shows up under one identity on OpenRouter's App Activity
+# page. https://openrouter.ai/docs/api-reference/overview#headers
+OPENROUTER_REFERER = "https://github.com/Shaivpidadi/FreeRide"
+OPENROUTER_APP_TITLE = "FreeRide Health Check"
+
+
+def _openrouter_headers(api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_REFERER,
+        "X-Title": OPENROUTER_APP_TITLE,
+    }
+
 # Per-process tracking of keys that recently returned 429/401, with a soft
 # cooldown so keys come back into rotation automatically. Short-lived CLI runs
 # never reach the cooldown; the watcher daemon does.
@@ -118,12 +133,8 @@ def fetch_all_models() -> list:
     for i, key in enumerate(keys, 1):
         if _is_key_in_cooldown(key):
             continue
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json"
-        }
         try:
-            response = requests.get(OPENROUTER_API_URL, headers=headers, timeout=30)
+            response = requests.get(OPENROUTER_API_URL, headers=_openrouter_headers(key), timeout=30)
         except requests.RequestException as e:
             print(f"  Key {i}: network error ({e})")
             continue
@@ -796,14 +807,8 @@ def _test_model(model_id: str):
     }
 
     for key in available:
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/Shaivpidadi/FreeRide",
-            "X-Title": "FreeRide"
-        }
         try:
-            response = requests.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=30)
+            response = requests.post(OPENROUTER_CHAT_URL, headers=_openrouter_headers(key), json=payload, timeout=30)
         except requests.Timeout:
             return False, "timeout"
         except requests.RequestException:
