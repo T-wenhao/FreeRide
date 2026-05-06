@@ -301,29 +301,34 @@ def save_openclaw_config(config: dict):
     OPENCLAW_CONFIG_PATH.write_text(json.dumps(config, indent=2))
 
 
-def format_model_for_openclaw(model_id: str, with_provider_prefix: bool = True, append_free: bool = True) -> str:
-    """Format an OpenRouter model ID for OpenClaw's config.
+def format_model_for_openclaw(model_id: str, append_free: bool = True) -> str:
+    """Format an OpenRouter model ID for OpenClaw config.
 
-    Most free models are `<vendor>/<model>:free` (e.g. `qwen/qwen3-coder:free`).
-    OpenClaw stores the primary as `openrouter/<vendor>/<model>:free` (with a
-    routing prefix) and fallbacks as the bare `<vendor>/<model>:free`.
+    Always returns the routing-prefixed form OpenClaw expects in `primary`,
+    `fallbacks`, and the `models` allowlist:
+
+      qwen/qwen3-coder:free   → openrouter/qwen/qwen3-coder:free
+      qwen/qwen3-coder        → openrouter/qwen/qwen3-coder:free   (append_free=True)
+      openrouter/owl-alpha    → openrouter/owl-alpha               (native, verbatim)
+      openrouter/free         → openrouter/free                    (native, verbatim)
+
+    The leading `openrouter/` is OpenClaw's routing prefix — it tells the
+    gateway to dispatch via the OpenRouter provider (using OPENROUTER_API_KEY)
+    rather than inferring the provider from the first segment of the ID.
+    Without it, OpenClaw sees `google/gemma:free` and tries to route to
+    Google's API directly, asking the user for a Google key (issue #12).
 
     OpenRouter-native models (`openrouter/free`, `openrouter/owl-alpha`) are
-    already fully qualified — the leading `openrouter/` is part of the model's
-    own ID, not a separate routing prefix. They go in verbatim everywhere and
-    don't take the `:free` tier suffix.
+    already fully qualified — the prefix is part of their identity, not a
+    separate routing prefix. They are returned verbatim, which also means we
+    can never accidentally double-prefix to `openrouter/openrouter/...`.
     """
-    # OpenRouter-native: use verbatim, don't re-prefix or append :free.
     if model_id.startswith("openrouter/"):
         return model_id
-
     base_id = model_id
     if append_free and ":free" not in base_id:
         base_id = f"{base_id}:free"
-
-    if with_provider_prefix:
-        return f"openrouter/{base_id}"
-    return base_id
+    return f"openrouter/{base_id}"
 
 
 def _config_primary_to_api_id(stored_id: str) -> str:
@@ -410,67 +415,47 @@ def update_model_config(
     if setup_auth:
         config = setup_openrouter_auth(config)
 
-    formatted_primary = format_model_for_openclaw(model_id, with_provider_prefix=True, append_free=append_free)
-    formatted_for_list = format_model_for_openclaw(model_id, with_provider_prefix=False, append_free=append_free)
+    formatted = format_model_for_openclaw(model_id, append_free=append_free)
 
     if as_primary:
-        # Set as primary model
-        config["agents"]["defaults"]["model"]["primary"] = formatted_primary
-        # Add to models allowlist
-        config["agents"]["defaults"]["models"][formatted_for_list] = {}
+        config["agents"]["defaults"]["model"]["primary"] = formatted
+        config["agents"]["defaults"]["models"][formatted] = {}
 
-    # Handle fallbacks
-    if add_fallbacks:
-        if get_api_keys():
-            free_models = get_free_models()
+    if add_fallbacks and get_api_keys():
+        free_models = get_free_models()
+        new_fallbacks = []
 
-            # Get existing fallbacks
-            existing_fallbacks = config["agents"]["defaults"]["model"].get("fallbacks", [])
+        # openrouter/free smart router is always the first fallback unless the
+        # user is making it the primary.
+        free_router = "openrouter/free"
+        if formatted != free_router:
+            new_fallbacks.append(free_router)
+            config["agents"]["defaults"]["models"][free_router] = {}
 
-            # Build new fallbacks list
-            new_fallbacks = []
+        for m in free_models:
+            if len(new_fallbacks) >= fallback_count:
+                break
 
-            # Always add openrouter/free as first fallback (smart router)
-            # Skip if it's being set as primary
-            free_router = "openrouter/free"
-            free_router_primary = format_model_for_openclaw("openrouter/free", with_provider_prefix=True)
-            if formatted_primary != free_router_primary and formatted_for_list != free_router:
-                new_fallbacks.append(free_router)
-                config["agents"]["defaults"]["models"][free_router] = {}
+            m_formatted = format_model_for_openclaw(m["id"])
 
-            for m in free_models:
-                # Reserve one slot for openrouter/free
-                if len(new_fallbacks) >= fallback_count:
-                    break
+            if "openrouter/free" in m["id"]:
+                continue
+            if as_primary and m_formatted == formatted:
+                continue
+            current_primary = config["agents"]["defaults"]["model"].get("primary", "")
+            if not as_primary and m_formatted == current_primary:
+                continue
 
-                m_formatted = format_model_for_openclaw(m["id"], with_provider_prefix=False)
-                m_formatted_primary = format_model_for_openclaw(m["id"], with_provider_prefix=True)
+            new_fallbacks.append(m_formatted)
+            config["agents"]["defaults"]["models"][m_formatted] = {}
 
-                # Skip openrouter/free (already added as first)
-                if "openrouter/free" in m["id"]:
-                    continue
+        if not as_primary:
+            if formatted not in new_fallbacks:
+                insert_pos = 1 if free_router in new_fallbacks else 0
+                new_fallbacks.insert(insert_pos, formatted)
+            config["agents"]["defaults"]["models"][formatted] = {}
 
-                # Skip if it's the new primary
-                if as_primary and (m_formatted == formatted_for_list or m_formatted_primary == formatted_primary):
-                    continue
-
-                # Skip if it's the current primary (when adding to fallbacks only)
-                current_primary = config["agents"]["defaults"]["model"].get("primary", "")
-                if not as_primary and m_formatted_primary == current_primary:
-                    continue
-
-                new_fallbacks.append(m_formatted)
-                config["agents"]["defaults"]["models"][m_formatted] = {}
-
-            # If not setting as primary, prepend new model to fallbacks (after openrouter/free)
-            if not as_primary:
-                if formatted_for_list not in new_fallbacks:
-                    # Insert after openrouter/free if present
-                    insert_pos = 1 if free_router in new_fallbacks else 0
-                    new_fallbacks.insert(insert_pos, formatted_for_list)
-                config["agents"]["defaults"]["models"][formatted_for_list] = {}
-
-            config["agents"]["defaults"]["model"]["fallbacks"] = new_fallbacks
+        config["agents"]["defaults"]["model"]["fallbacks"] = new_fallbacks
 
     save_openclaw_config(config)
     return True
@@ -514,13 +499,11 @@ def cmd_list(args):
         else:
             context_str = f"{context} tokens"
 
-        # Check status
-        formatted = format_model_for_openclaw(model_id, with_provider_prefix=True)
-        formatted_fallback = format_model_for_openclaw(model_id, with_provider_prefix=False)
+        formatted = format_model_for_openclaw(model_id)
 
         if current and formatted == current:
             status = "[PRIMARY]"
-        elif formatted_fallback in fallbacks or formatted in fallbacks:
+        elif formatted in fallbacks:
             status = "[FALLBACK]"
         else:
             status = ""
@@ -770,23 +753,19 @@ def cmd_fallbacks(args):
     models = get_free_models()
     config = ensure_config_structure(config)
 
-    # Get fallbacks excluding current model
     fallbacks = []
 
-    # Always add openrouter/free as first fallback (smart router)
+    # openrouter/free smart router always leads.
     free_router = "openrouter/free"
-    free_router_primary = format_model_for_openclaw("openrouter/free", with_provider_prefix=True)
-    if not current or current != free_router_primary:
+    if not current or current != free_router:
         fallbacks.append(free_router)
         config["agents"]["defaults"]["models"][free_router] = {}
 
     for m in models:
-        formatted = format_model_for_openclaw(m["id"], with_provider_prefix=False)
-        formatted_primary = format_model_for_openclaw(m["id"], with_provider_prefix=True)
+        formatted = format_model_for_openclaw(m["id"])
 
-        if current and (formatted_primary == current):
+        if current and formatted == current:
             continue
-        # Skip openrouter/free (already added as first)
         if "openrouter/free" in m["id"]:
             continue
         if len(fallbacks) >= args.count:
@@ -921,22 +900,21 @@ def rotate(force: bool = False, fallback_count: int = 5):
     if not new_primary:
         return False, "no_working_models"
 
-    formatted_primary = format_model_for_openclaw(new_primary, with_provider_prefix=True)
-    formatted_for_list = format_model_for_openclaw(new_primary, with_provider_prefix=False)
-    config["agents"]["defaults"]["model"]["primary"] = formatted_primary
-    config["agents"]["defaults"]["models"][formatted_for_list] = {}
+    formatted = format_model_for_openclaw(new_primary)
+    config["agents"]["defaults"]["model"]["primary"] = formatted
+    config["agents"]["defaults"]["models"][formatted] = {}
 
     fallbacks = ["openrouter/free"]
     config["agents"]["defaults"]["models"]["openrouter/free"] = {}
     for fb_id in verified_fallbacks:
-        fb_fmt = format_model_for_openclaw(fb_id, with_provider_prefix=False)
+        fb_fmt = format_model_for_openclaw(fb_id)
         fallbacks.append(fb_fmt)
         config["agents"]["defaults"]["models"][fb_fmt] = {}
 
     config["agents"]["defaults"]["model"]["fallbacks"] = fallbacks
     save_openclaw_config(config)
 
-    print(f"Done. Primary: {formatted_primary}")
+    print(f"Done. Primary: {formatted}")
     print(f"Fallbacks ({len(fallbacks)}):")
     for fb in fallbacks:
         print(f"  - {fb}")
