@@ -11,6 +11,38 @@
 [![OpenClaw Compatible](https://img.shields.io/badge/OpenClaw-Compatible-blue.svg)](https://github.com/openclaw/openclaw)
 ---
 
+> ## 🚀 FreeRide v3 is out — works with **any** OpenAI-compatible agent
+>
+> The version on this repo (v2) is OpenClaw-specific and OpenRouter-only.
+> **[FreeRide v3](https://github.com/Shaivpidadi/FreeRideV3)** is a local
+> OpenAI-compatible gateway that routes across **5 free-tier providers**
+> (OpenRouter, Groq, NVIDIA NIM, Cloudflare Workers AI, HuggingFace) with
+> automatic failover, and works with **Aider, Continue, Hermes, OpenClaw,
+> the OpenAI Python SDK, and any other OpenAI-shaped client**.
+>
+> ```bash
+> curl -sSL https://api.free-ride.xyz/install.sh | sh
+> export OPENROUTER_API_KEY=sk-or-v1-...
+> freeride serve
+> ```
+>
+> Then point any agent at `http://localhost:11343/v1` — or use a binder:
+>
+> ```bash
+> freeride bind aider       # writes ~/.aider.conf.yml
+> freeride bind continue    # writes ~/.continue/config.yaml
+> freeride bind hermes      # writes ~/.hermes/config.yaml
+> freeride bind openclaw    # writes ~/.openclaw/openclaw.json
+> ```
+>
+> 👉 **Repo:** https://github.com/Shaivpidadi/FreeRideV3 · **Site:** https://free-ride.xyz · **PyPI:** `pip install freeride-gateway`
+>
+> The v2 surface below still works for existing OpenClaw users — v3 ships
+> v2 backwards-compat shims (`freeride auto/list/switch/...`), so an
+> in-place upgrade preserves your existing setup.
+
+---
+
 **FreeRide** gives you unlimited free AI in [OpenClaw](https://github.com/openclaw/openclaw) by automatically managing OpenRouter's free models.
 
 ```
