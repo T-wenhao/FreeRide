@@ -336,10 +336,9 @@ def get_current_fallbacks(config: dict = None) -> list:
     result = []
     for fb in config.get("fallback_providers", []):
         if isinstance(fb, dict):
-            p = fb.get("provider", "")
             m = fb.get("model", "")
-            if p and m:
-                result.append(f"{p}/{m}")
+            if fb.get("provider") and m:
+                result.append(m)
     return result
 
 
@@ -456,9 +455,7 @@ def cmd_list(args):
         else:
             context_str = f"{context} tokens"
 
-        # Build display ID matching Hermes fallback_providers format
-        provider = model_id.split("/")[0] if "/" in model_id else ""
-        display_id = f"{provider}/{model_id}" if provider else model_id
+        display_id = model_id
 
         current_model_id = current.split("/", 1)[-1] if current and "/" in current else current
         if current and model_id == current_model_id:
@@ -729,7 +726,7 @@ def cmd_fallbacks(args):
 
     print(f"\nConfigured {len(fallbacks)} fallback models:")
     for i, fb in enumerate(fallbacks, 1):
-        print(f"  {i}. {fb['provider']}/{fb['model']}")
+        print(f"  {i}. {fb['model']}")
 
     print("\nWhen rate limited, Hermes will automatically try these models.")
     print("Run 'hermes gateway restart' for changes to take effect.")
@@ -857,11 +854,10 @@ def rotate(force: bool = False, fallback_count: int = 5):
     config["fallback_providers"] = fallbacks
     save_config(config)
 
-    primary_display = f"{provider}/{model}"
-    print(f"Done. Primary: {primary_display}")
+    print(f"Done. Primary: {new_primary}")
     print(f"Fallbacks ({len(fallbacks)}):")
     for fb in fallbacks:
-        print(f"  - {fb['provider']}/{fb['model']}")
+        print(f"  - {fb['model']}")
     return True, None
 
 
